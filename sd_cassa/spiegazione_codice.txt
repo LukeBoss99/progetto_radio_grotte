@@ -1,0 +1,234 @@
+SPIEGAZIONE DETTAGLIATA DI sd_cassa.ino
+========================================
+
+Questo sketch legge un file audio WAV dalla scheda SD e lo riproduce tramite
+un amplificatore I2S MAX98357A collegato a un ESP32.
+
+
+1. LIBRERIE INCLUSE
+--------------------
+#include <SPI.h>
+    Serve per comunicare con la scheda SD, che usa il bus SPI (Serial
+    Peripheral Interface) per scambiare dati con l'ESP32.
+
+#include <SD.h>
+    Libreria ad alto livello che permette di aprire, leggere e navigare
+    file e cartelle sulla scheda SD come se fosse un normale filesystem
+    (stessa libreria usata in arduino_sd.ino).
+
+#include <driver/i2s.h>
+    Driver I2S nativo di ESP-IDF (il framework su cui si basa Arduino per
+    ESP32). L'I2S è un protocollo digitale seriale pensato apposta per
+    trasmettere audio PCM: usa 3 linee (BCLK, LRC/WS, DATA) invece del
+    singolo filo analogico di un DAC tradizionale. Il MAX98357A riceve
+    l'audio proprio in questo formato e lo amplifica direttamente,
+    pilotando uno speaker senza bisogno di un DAC esterno.
+
+
+2. DEFINE E COSTANTI
+---------------------
+SD_CS_PIN (5)
+    Pin "Chip Select" della scheda SD: è il segnale con cui l'ESP32 dice
+    alla SD "adesso sto parlando con te" sul bus SPI (che è condiviso da
+    più dispositivi).
+
+I2S_BCLK_PIN (26), I2S_LRC_PIN (25), I2S_DOUT_PIN (22)
+    I tre pin usati per il bus I2S verso il MAX98357A:
+      - BCLK (Bit Clock): scandisce il ritmo con cui viaggiano i singoli
+        bit dei campioni audio.
+      - LRC / WS (Word Select / Left-Right Clock): dice al MAX98357A se
+        il bit che sta arrivando appartiene al canale sinistro o destro.
+      - DOUT / DIN: la linea dati vera e propria, cioè i campioni audio
+        codificati in PCM.
+
+AUDIO_FILE ("/audio.wav")
+    Nome (con percorso assoluto sulla SD) del file che lo sketch prova
+    ad aprire per primo.
+
+
+3. STRUTTURA WavInfo
+---------------------
+struct WavInfo {
+  uint32_t sampleRate;     // frequenza di campionamento (es. 44100 Hz)
+  uint16_t numChannels;    // 1 = mono, 2 = stereo
+  uint16_t bitsPerSample;  // 8 o 16 bit per campione
+  uint32_t dataSize;       // dimensione in byte dei dati audio veri e propri
+};
+    Contenitore che raccoglie le informazioni estratte dall'header del
+    file WAV, necessarie per configurare correttamente l'I2S prima di
+    riprodurre l'audio.
+
+
+4. findFirstWavFile()
+----------------------
+Funzione di ripiego (fallback): se il file AUDIO_FILE non esiste, questa
+funzione:
+  1. Apre la cartella radice "/" della SD.
+  2. Scorre tutti i file con root.openNextFile() uno alla volta.
+  3. Per ogni file (che non sia una cartella) controlla se il nome,
+     convertito in minuscolo, termina con ".wav".
+  4. Al primo trovato, restituisce il percorso completo (entry.path()).
+  5. Se non trova nulla, restituisce una stringa vuota "".
+
+Questo permette allo sketch di funzionare anche se il file non si chiama
+esattamente "audio.wav", purché sia l'unico/primo .wav nella root.
+
+
+5. parseWavHeader(file, info)
+-------------------------------
+Un file WAV è organizzato in "chunk" (blocchi), ciascuno con:
+  - un identificatore di 4 caratteri (es. "fmt ", "data", "LIST"...)
+  - una dimensione a 4 byte che dice quanto è lungo il contenuto del chunk
+  - il contenuto vero e proprio
+
+Struttura generale di un file WAV:
+
+  offset 0-3   : "RIFF"          (identifica il formato contenitore)
+  offset 4-7   : dimensione totale del file - 8
+  offset 8-11  : "WAVE"          (identifica il sottotipo: audio WAVE)
+  offset 12... : sequenza di chunk, tra cui almeno:
+                   "fmt "  -> parametri audio (canali, sample rate, bit)
+                   "data"  -> i campioni audio veri e propri
+
+La funzione:
+  1. Legge i primi 4 byte e verifica che siano "RIFF".
+  2. Salta a offset 8 e verifica che ci siano i 4 byte "WAVE".
+     Se una delle due verifiche fallisce, il file non è un WAV valido
+     e la funzione restituisce false.
+  3. Entra in un ciclo che legge i chunk uno dopo l'altro:
+     - legge l'id (4 byte) e la dimensione del chunk (4 byte);
+     - se l'id è "fmt ", legge in sequenza:
+         audioFormat (2 byte, non usato direttamente: 1 = PCM non compresso)
+         numChannels (2 byte)
+         sampleRate  (4 byte)
+         [byteRate (4 byte) + blockAlign (2 byte) vengono saltati con
+          file.seek, perché non servono per configurare l'I2S]
+         bitsPerSample (2 byte)
+       Se il chunk "fmt " è più lungo dei 16 byte standard (capita con
+       alcuni encoder), salta i byte extra.
+     - se l'id è "data", salva la dimensione in info.dataSize e interrompe
+       il ciclo: a questo punto il "cursore" di lettura del file si trova
+       esattamente all'inizio dei campioni audio, pronto per essere letto
+       da playWav().
+     - per qualunque altro chunk (es. "LIST", "fact", metadati vari),
+       lo salta per intero con file.seek(), avanzando di chunkSize byte
+       (+1 byte di padding se chunkSize è dispari, perché i chunk WAV
+       sono sempre allineati a un numero pari di byte).
+  4. Restituisce true solo se sono stati trovati sia il chunk "fmt " sia
+     il chunk "data".
+
+
+6. playWav(file, info)
+------------------------
+Questa è la funzione che invia davvero l'audio al MAX98357A.
+
+a) Configurazione del formato canali:
+   Se il file è mono (numChannels == 1), usa
+   I2S_CHANNEL_FMT_ONLY_LEFT: invia un solo canale, che il MAX98357A
+   riproduce comunque correttamente (l'IC internamente lo gestisce come
+   audio "centrale"). Se è stereo, usa I2S_CHANNEL_FMT_RIGHT_LEFT per
+   inviare campioni interlacciati sinistro/destro.
+
+b) i2s_config_t i2sConfig:
+   Struttura di configurazione del driver I2S:
+     - mode: MASTER + TX -> l'ESP32 genera lui il clock (BCLK/LRC) ed è
+       in modalità trasmissione (invia dati, non li riceve).
+     - sample_rate: preso dall'header WAV (es. 44100).
+     - bits_per_sample: fissato a 16 bit, perché anche i file a 8 bit
+       vengono convertiti a 16 bit prima di essere inviati (il MAX98357A
+       lavora meglio con campioni a 16/32 bit).
+     - channel_format: come deciso al punto (a).
+     - communication_format: I2S_COMM_FORMAT_STAND_I2S, cioè il protocollo
+       I2S "standard" (Philips), quello atteso dal MAX98357A.
+     - dma_buf_count / dma_buf_len: quanti buffer DMA usare e quanto sono
+       grandi. Il DMA (Direct Memory Access) permette all'ESP32 di inviare
+       i dati audio all'I2S in background, senza bloccare la CPU per ogni
+       singolo campione: mentre un buffer viene trasmesso, la CPU può
+       riempirne un altro.
+
+c) i2s_pin_config_t pinConfig:
+   Associa i segnali logici I2S (bck, ws, data_out) ai pin fisici GPIO
+   definiti a inizio file (26, 25, 22). data_in_num è impostato a
+   I2S_PIN_NO_CHANGE perché non serve ricevere audio, solo trasmetterlo.
+
+d) i2s_driver_install() e i2s_set_pin():
+   Inizializzano il driver I2S con la configurazione scelta e collegano
+   i pin fisici.
+
+e) Ciclo di riproduzione:
+   uint8_t buffer[1024];           -> buffer di lettura grezzo dalla SD
+   static int16_t convBuffer[1024]; -> buffer usato solo per convertire
+                                        campioni a 8 bit in campioni a 16 bit
+
+   Finché ci sono byte audio da leggere (bytesRemaining > 0) e il file
+   ha ancora dati disponibili:
+     1. Legge fino a 1024 byte dal file SD nel buffer.
+     2. Se bitsPerSample è 8:
+          ogni campione (un byte, valore 0-255, "unsigned") viene
+          convertito in un campione a 16 bit "signed" con la formula
+          ((int16_t)buffer[i] - 128) << 8
+          - il "-128" riporta il valore centrato su zero (da 0..255 a
+            -128..127), perché l'audio a 8 bit WAV è unsigned mentre
+            quello a 16 bit è signed;
+          - lo "<< 8" (shift di 8 bit a sinistra) espande la dinamica da
+            8 a 16 bit, portando il range a circa -32768..32512.
+        Il buffer convertito viene poi inviato con i2s_write.
+     3. Se bitsPerSample è 16, i byte letti sono già nel formato giusto
+        e vengono inviati direttamente con i2s_write.
+     4. i2s_write() scrive i campioni nei buffer DMA: la funzione si
+        blocca (portMAX_DELAY) finché non c'è spazio libero, quindi il
+        ciclo procede al ritmo con cui l'I2S consuma effettivamente i
+        dati, sincronizzando automaticamente lettura SD e riproduzione.
+     5. bytesRemaining viene decrementato dei byte letti dal file (non
+        di quelli scritti via I2S, che dopo la conversione a 16 bit
+        possono essere il doppio nel caso di file a 8 bit).
+
+f) Al termine, i2s_driver_uninstall() libera le risorse del driver I2S
+   (buffer DMA, interrupt) dato che la riproduzione è finita.
+
+
+7. setup()
+-----------
+Eseguita una sola volta all'avvio/reset della scheda:
+  1. Avvia la porta seriale a 115200 baud per il debug.
+  2. Inizializza la SD con SD.begin(SD_CS_PIN). Se fallisce, stampa un
+     errore e si ferma (return esce da setup, loop() non fa comunque
+     nulla di utile).
+  3. Controlla che sia stata rilevata una scheda SD valida
+     (SD.cardType() != CARD_NONE).
+  4. Verifica se esiste il file AUDIO_FILE ("/audio.wav"):
+       - se esiste, lo usa;
+       - altrimenti chiama findFirstWavFile() per cercare un'alternativa.
+       Se nemmeno questa cerca trova nulla, si ferma con un messaggio di
+       errore.
+  5. Apre il file scelto con SD.open(path).
+  6. Chiama parseWavHeader() per leggere le informazioni audio dall'header.
+     Se il file non è un WAV valido, si ferma con un errore.
+  7. Verifica che bitsPerSample sia 8 o 16 e che numChannels sia 1 o 2
+     (altri formati, es. 24/32 bit o più di 2 canali, non sono gestiti
+     da questo sketch e vengono rifiutati esplicitamente).
+  8. Stampa un riepilogo dei parametri del file (sample rate, canali,
+     bit, dimensione dati) per debug.
+  9. Chiama playWav() per riprodurre effettivamente l'audio.
+  10. Chiude il file con audioFile.close().
+
+
+8. loop()
+----------
+Vuota: tutta la logica avviene una sola volta in setup(). Il file viene
+riprodotto una volta sola all'accensione/reset dell'ESP32; per
+riascoltarlo bisogna resettare la scheda.
+
+
+RIEPILOGO DEL FLUSSO
+---------------------
+Accensione/reset
+  -> inizializza seriale e SD
+  -> trova/apre il file .wav
+  -> legge l'header per capire sample rate / canali / bit
+  -> configura l'I2S di conseguenza
+  -> legge il file a blocchi da 1KB dalla SD
+  -> (se necessario) converte gli 8 bit in 16 bit
+  -> invia i campioni al MAX98357A via I2S, che li amplifica e li manda
+     allo speaker
+  -> a fine file, chiude tutto e si ferma
