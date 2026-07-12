@@ -1,0 +1,217 @@
+SPIEGAZIONE DETTAGLIATA DI mic_cassa.ino
+==========================================
+
+Questo sketch cattura in tempo reale l'audio di un microfono digitale I2S
+SPH0645 e lo riproduce immediatamente sulla cassa collegata tramite un
+amplificatore I2S MAX98357A, su ESP32. E' un "loopback" continuo: non c'e'
+nessuna registrazione, il suono viene solo letto dal microfono e rimandato
+subito alla cassa, in un ciclo infinito.
+
+
+1. LIBRERIE INCLUSE
+--------------------
+#include <driver/i2s.h>
+    Driver I2S nativo di ESP-IDF (stesso usato in sd_cassa.ino). L'I2S e' un
+    protocollo digitale seriale per audio PCM che usa 3 linee (BCLK, WS/LRC,
+    DATA). Sia il microfono SPH0645 che l'amplificatore MAX98357A parlano
+    questo protocollo: il primo lo usa per "spedire" i campioni catturati,
+    il secondo per "ricevere" i campioni da amplificare.
+
+    L'ESP32 (originale, non S2/S3/C3) ha due periferiche I2S hardware
+    indipendenti, chiamate I2S_NUM_0 e I2S_NUM_1. Questo sketch le usa
+    entrambe contemporaneamente: una in ricezione (RX) dal microfono, una
+    in trasmissione (TX) verso la cassa.
+
+
+2. DEFINE E COSTANTI
+---------------------
+MIC_BCLK_PIN (32), MIC_LRCL_PIN (33), MIC_DIN_PIN (34)
+    Pin I2S verso il microfono SPH0645:
+      - BCLK: clock che scandisce il ritmo dei singoli bit.
+      - LRCL (Word Select): dice al microfono quando deve inviare il
+        campione del canale sinistro o destro.
+      - DOUT/DIN: linea dati; e' un ingresso per l'ESP32 (il microfono
+        "parla", l'ESP32 "ascolta"). Per questo e' collegata a GPIO 34,
+        che su ESP32 e' un pin input-only.
+
+SPK_BCLK_PIN (26), SPK_LRC_PIN (25), SPK_DOUT_PIN (22)
+    Pin I2S verso l'amplificatore MAX98357A, identici a quelli usati in
+    sd_cassa.ino: qui invece la linea dati e' un'uscita (l'ESP32 "parla",
+    l'amplificatore "ascolta").
+
+SAMPLE_RATE (16000)
+    Frequenza di campionamento usata sia in lettura dal microfono sia in
+    scrittura verso la cassa: deve essere la stessa su entrambi i lati,
+    altrimenti l'audio risulterebbe accelerato/rallentato o distorto.
+    16 kHz e' un buon compromesso per voce/rumori ambientali con un carico
+    di calcolo contenuto.
+
+I2S_MIC_PORT (I2S_NUM_0), I2S_SPK_PORT (I2S_NUM_1)
+    Assegnano una periferica I2S diversa al microfono e alla cassa, cosi'
+    possono lavorare contemporaneamente senza interferire tra loro.
+
+BUFFER_SAMPLES (256)
+    Quanti campioni vengono letti/scritti a ogni giro di loop(). Un valore
+    piccolo riduce la latenza (il tempo tra "il microfono sente qualcosa" e
+    "la cassa lo riproduce") ma aumenta il numero di letture/scritture al
+    secondo; 256 campioni a 16 kHz corrispondono a circa 16 millisecondi di
+    audio per blocco, un buon compromesso.
+
+micBuffer / spkBuffer
+    Due array globali statici: micBuffer contiene i campioni grezzi letti
+    dal microfono (32 bit ciascuno, il formato nativo del driver I2S in
+    RX), spkBuffer contiene gli stessi campioni convertiti a 16 bit,
+    pronti per essere inviati alla cassa.
+
+
+3. setupMic()
+---------------
+Configura la periferica I2S_NUM_0 in modalita' ricezione (RX):
+
+a) i2s_config_t micConfig:
+     - mode: MASTER + RX -> l'ESP32 genera lui il clock (BCLK/WS) ed e' in
+       ascolto (riceve dati, non li invia).
+     - sample_rate: SAMPLE_RATE (16000 Hz).
+     - bits_per_sample: I2S_BITS_PER_SAMPLE_32BIT. Il microfono SPH0645
+       trasmette campioni a 18 bit, ma il driver I2S dell'ESP32 li legge
+       sempre "impacchettati" in parole da 32 bit (i bit non significativi
+       restano a zero).
+     - channel_format: I2S_CHANNEL_FMT_ONLY_LEFT, perche' il microfono e'
+       mono e il pin SEL e' collegato a GND (che seleziona il canale
+       sinistro).
+     - communication_format: I2S_COMM_FORMAT_STAND_I2S, il protocollo I2S
+       "standard" (Philips) che il microfono si aspetta.
+     - dma_buf_count / dma_buf_len: numero e dimensione dei buffer DMA
+       usati per accumulare i campioni in arrivo senza intasare la CPU.
+
+b) i2s_pin_config_t micPins:
+     Associa i segnali logici I2S ai pin fisici GPIO (32, 33, 34).
+     - mck_io_num e' impostato esplicitamente a I2S_PIN_NO_CHANGE. Questo
+       campo, se lasciato non inizializzato, vale 0 (cioe' GPIO 0) per
+       default: con due periferiche I2S attive contemporaneamente,
+       entrambe proverebbero a "prenotare" lo stesso GPIO 0 per il clock
+       master (MCLK, che qui non serve), causando un conflitto che manda
+       in errore la configurazione dei pin della SECONDA periferica
+       inizializzata (in pratica azzittiva la cassa senza nessun errore
+       visibile a runtime, se non nel log seriale). Impostarlo a
+       I2S_PIN_NO_CHANGE dice al driver "non toccare/non usare l'MCLK".
+     - data_out_num e' I2S_PIN_NO_CHANGE perche' il microfono non riceve
+       mai dati dall'ESP32, solo li invia.
+
+c) i2s_driver_install() e i2s_set_pin() inizializzano il driver e
+   collegano i pin fisici, esattamente come in sd_cassa.ino.
+
+
+4. setupSpeaker()
+--------------------
+Configura la periferica I2S_NUM_1 in modalita' trasmissione (TX), in modo
+molto simile a playWav() di sd_cassa.ino:
+     - mode: MASTER + TX.
+     - bits_per_sample: I2S_BITS_PER_SAMPLE_16BIT, perche' i campioni
+       inviati alla cassa sono gia' stati convertiti a 16 bit nel loop().
+     - channel_format: I2S_CHANNEL_FMT_ONLY_LEFT (audio mono).
+     - stesso discorso di mck_io_num = I2S_PIN_NO_CHANGE visto sopra.
+     - data_in_num e' I2S_PIN_NO_CHANGE perche' la cassa non invia mai
+       dati all'ESP32, solo li riceve.
+
+
+5. playTestTone() [funzione di debug]
+----------------------------------------
+Genera e invia direttamente alla cassa un tono sinusoidale puro a 440 Hz
+per 2 secondi, PRIMA di iniziare il loop microfono->cassa. Serve solo a
+verificare, in fase di collaudo, che il percorso ESP32 -> MAX98357A ->
+speaker funzioni davvero, indipendentemente dal microfono:
+  - calcola ogni campione con la formula del seno:
+      valore = ampiezza * sin(2*pi * frequenza * tempo)
+    dove "tempo" avanza di 1/SAMPLE_RATE secondi a ogni campione;
+  - l'ampiezza (10000 su un massimo teorico di 32767) tiene il volume
+    moderato per non saturare;
+  - i campioni vengono generati e scritti alla cassa a blocchi di
+    BUFFER_SAMPLES, come nel loop principale.
+Questa funzione e' pensata come strumento diagnostico: si puo' rimuovere
+(o commentare la chiamata in setup()) una volta verificato che l'hardware
+funziona.
+
+
+6. setup()
+-----------
+Eseguita una sola volta all'avvio/reset:
+  1. Avvia la seriale a 115200 baud per il debug.
+  2. Inizializza il microfono (setupMic()) e la cassa (setupSpeaker()).
+  3. Riproduce il tono di test (playTestTone()), utile in fase di collaudo
+     per isolare eventuali problemi hardware sul lato cassa.
+  4. Stampa un messaggio di "pronto": da qui in poi tutta la logica vive
+     in loop().
+
+
+7. loop()
+----------
+Eseguito continuamente, e' il cuore del loopback microfono -> cassa:
+
+  1. i2s_read(): legge fino a sizeof(micBuffer) byte dal microfono nel
+     buffer micBuffer. La chiamata e' bloccante (portMAX_DELAY): il codice
+     si ferma qui finche' non sono disponibili abbastanza campioni, il che
+     sincronizza automaticamente il ritmo del loop con quello reale del
+     microfono (circa ogni 16 ms, vista la dimensione del buffer).
+
+  2. Conversione campione per campione (ciclo for):
+     Ogni campione letto (int32_t, 32 bit) viene convertito in un
+     campione PCM a 16 bit con segno con un semplice shift aritmetico:
+        int32_t sample = micBuffer[i] >> 16;
+     Il motivo: il microfono SPH0645 invia campioni a 18 bit, che il
+     driver I2S colloca gia' nella parte ALTA della parola a 32 bit (i 14
+     bit piu' bassi restano sempre a zero). Prendendo direttamente i 16
+     bit piu' significativi (shift di 16 posizioni) si ottiene un valore
+     a 16 bit gia' nel range corretto per un campione PCM con segno, senza
+     bisogno di ulteriori correzioni.
+
+     Il risultato viene poi "clampato" (limitato) al range di un int16_t
+     (-32768..32767) per sicurezza, e salvato in spkBuffer[i].
+
+     In parallelo, viene tenuto traccia del valore assoluto piu' alto
+     (peak) tra tutti i campioni del blocco, usato solo per il VU-meter
+     stampato sulla seriale (vedi punto 4 sotto).
+
+  3. i2s_write(): invia spkBuffer (i campioni appena convertiti) alla
+     cassa tramite I2S_SPK_PORT. Anche questa chiamata e' bloccante, e
+     scrive esattamente lo stesso numero di campioni appena letti dal
+     microfono: il flusso dati e' quindi 1:1, senza buffering aggiuntivo
+     ne' accumulo di ritardo nel tempo.
+
+  4. VU-meter di debug: ogni LEVEL_PRINT_INTERVAL_MS (200 ms) stampa sulla
+     porta seriale il valore di picco del blocco corrente sotto forma di
+     una barra testuale (####...), utile per verificare "a occhio" che il
+     microfono stia effettivamente captando suono (la barra si allunga
+     parlando/battendo le mani vicino al microfono) senza dover collegare
+     un vero analizzatore audio.
+
+
+RIEPILOGO DEL FLUSSO
+---------------------
+Accensione/reset
+  -> inizializza seriale, microfono (I2S RX) e cassa (I2S TX)
+  -> riproduce un tono di test a 440 Hz (verifica hardware cassa)
+  -> entra in loop() e per sempre:
+       legge un blocco di campioni dal microfono (32 bit ciascuno)
+       -> li converte a 16 bit con uno shift aritmetico di 16 bit
+       -> li scrive subito alla cassa via I2S
+       -> aggiorna il VU-meter sulla porta seriale
+  -> nessun dato viene salvato: e' un ascolto dal vivo, non una
+     registrazione
+
+
+NOTE SU UN PROBLEMA INCONTRATO IN FASE DI COLLAUDO
+-----------------------------------------------------
+Durante lo sviluppo, la cassa restava muta anche con il microfono
+funzionante: il log seriale mostrava l'errore
+
+  E i2s(legacy): i2s_check_set_mclk: mclk configure failed
+  E i2s(legacy): i2s_set_pin: mclk config failed
+
+Il campo mck_io_num della struct i2s_pin_config_t, se non inizializzato
+esplicitamente, vale 0 (GPIO 0) per default. Con due periferiche I2S
+attive, entrambe cercavano di "prenotarsi" lo stesso GPIO 0 per il clock
+master (che qui non serve a nessuna delle due), e la seconda
+inizializzazione (quella della cassa) falliva silenziosamente lasciandola
+senza segnale. La soluzione e' stata impostare esplicitamente
+mck_io_num = I2S_PIN_NO_CHANGE in entrambe le configurazioni dei pin.
